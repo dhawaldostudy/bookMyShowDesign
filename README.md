@@ -928,5 +928,752 @@ Pessimistic locking holds database locks during the entire payment flow (could b
 
 **Why not distributed locks (Redis Redlock)?**  
 Adds complexity, requires external coordination. Database constraints are simpler and more reliable.
+### Q2: How does your caching strategy handle cache invalidation?
+
+**Answer:**  
+We use a **multi-layered invalidation strategy**:
+
+1. **Immediate Invalidation (Write-Through):**
+   - On seat lock/unlock/booking → Delete cache key immediately
+   - Ensures next read gets fresh data from DB
+   
+2. **TTL-Based Expiry:**
+   - All cache entries have 5-minute TTL as safety net
+   - Prevents stale data if invalidation fails
+   
+3. **Pub/Sub for Multi-Instance:**
+```java
+   // When seat status changes
+   redisPublisher.publish("seat.updated", showId);
+   
+   // All instances listen
+   @RedisMessageListener(channel = "seat.updated")
+   public void onSeatUpdate(Long showId) {
+       cacheService.invalidate("show:seats:" + showId);
+   }
+```
+
+**Why not update cache instead of invalidate?**  
+Updating cache risks race conditions (write-write conflicts). Invalidation is safer—next read will fetch correct data from DB.
+
+---
+
+### Q3: What happens if payment succeeds but the booking update fails?
+
+**Answer:**  
+This is the **distributed transaction problem**. Our solution uses **idempotent payments + compensating transactions**:
+
+**Success Path:**
+1. Lock seats → Create PENDING booking
+2. Call payment service (with `idempotencyKey = bookingId`)
+3. Payment succeeds → Update booking to CONFIRMED
+4. Update seats to BOOKED
+
+**Failure Scenarios:**
+
+| Failure Point | Recovery Strategy |
+|--------------|-------------------|
+| Payment API call fails (network) | Retry with same `idempotencyKey` (payment gateway deduplicates) |
+| Payment succeeds but DB update fails | Background reconciliation job queries payment gateway, updates DB |
+| Payment fails | Rollback: Cancel booking, release seats to AVAILABLE |
+
+**Reconciliation Job (runs every 5 min):**
+```java
+// Find bookings with successful payment but still PENDING
+List inconsistentBookings = bookingRepository
+    .findByStatusAndPaymentIdNotNull(BookingStatus.PENDING);
+
+for (Booking booking : inconsistentBookings) {
+    PaymentStatus status = paymentService.getPaymentStatus(booking.getPaymentId());
+    if (status == PaymentStatus.SUCCESS) {
+        booking.setBookingStatus(BookingStatus.CONFIRMED);
+        bookingRepository.save(booking);
+    }
+}
+```
+
+**Why not 2PC (Two-Phase Commit)?**  
+Traditional 2PC requires distributed locks across services (payment + booking), which is slow and brittle. Our approach uses idempotency + eventual consistency for reliability.
+
+---
+
+### Q4: How do you handle high traffic during movie premieres (10M concurrent users)?
+
+**Answer:**  
+Multi-pronged approach:
+
+**1. Horizontal Scaling:**
+- **API Layer:** Stateless Spring Boot instances behind ALB (auto-scale based on CPU)
+- **Database:** Read replicas (5x) for search queries, write traffic to master
+- **Cache:** Redis Cluster (3 masters + 3 replicas) distributes load
+
+**2. Database Sharding:**
+- **Shard Key:** `city` (geo-based)
+- **Rationale:** Users typically book shows in their city
+- **Example:** Mumbai users → Shard 1, Delhi users → Shard 2
+- **Query Routing:** Application layer routes based on `cityId`
+```java
+@Bean
+public DataSource dataSource() {
+    Map shards = new HashMap<>();
+    shards.put("MUMBAI", mumbaiDataSource());
+    shards.put("DELHI", delhiDataSource());
+    shards.put("BANGALORE", bangaloreDataSource());
+    
+    ShardingDataSource ds = new ShardingDataSource();
+    ds.setTargetDataSources(shards);
+    ds.setDefaultTargetDataSource(mumbaiDataSource());
+    return ds;
+}
+```
+
+**3. Rate Limiting:**
+- **User-Level:** 10 booking attempts per minute (prevents abuse)
+- **API-Level:** 1000 requests/sec per instance (circuit breaker opens beyond this)
+```java
+@RateLimiter(name = "bookingApi", fallbackMethod = "rateLimitFallback")
+public BookingResponse lockSeats(LockSeatsRequest request) {
+    // Booking logic
+}
+```
+
+**4. Queue-Based Fairness:**
+- Use virtual waiting room (AWS CloudFront + Lambda@Edge) for premiere shows
+- Users get a queue position, admitted in batches to prevent thundering herd
+
+**5. CDN for Static Assets:**
+- Movie posters, show timings cached on CloudFront (reduces origin load by 90%)
+
+---
+
+### Q5: How do you ensure data consistency across microservices?
+
+**Answer:**  
+We use **Saga Pattern with Choreography** for cross-service transactions:
+
+**Scenario:** Booking confirmation involves 3 services:
+1. Booking Service (update booking)
+2. Payment Service (charge card)
+3. Notification Service (send email)
+
+**Event Flow:**
+```mermaid
+sequenceDiagram
+    participant BS as Booking Service
+    participant Kafka as Kafka
+    participant PS as Payment Service
+    participant NS as Notification Service
+    
+    BS->>Kafka: Publish 'booking.initiated' event
+    Kafka->>PS: Consume event
+    PS->>PS: Process payment
+    
+    alt Payment Success
+        PS->>Kafka: Publish 'payment.success' event
+        Kafka->>BS: Consume event
+        BS->>BS: Confirm booking
+        BS->>Kafka: Publish 'booking.confirmed' event
+        Kafka->>NS: Consume event
+        NS->>NS: Send email/SMS
+    else Payment Failure
+        PS->>Kafka: Publish 'payment.failed' event
+        Kafka->>BS: Consume event
+        BS->>BS: Cancel booking, release seats
+    end
+```
+
+**Compensating Transactions:**
+- Each service maintains its own database (no shared DB)
+- Failed step → Publish compensating event (e.g., `booking.cancelled`)
+- Services roll back their local state independently
+
+**Eventual Consistency Trade-offs:**
+- **Pro:** High availability, services independently scalable
+- **Con:** Short delay (100-500ms) before all services consistent
+- **Acceptable for:** Notification delays are fine; booking state must be immediate (handled via DB transaction)
+
+**Alternatives Considered:**
+
+| Pattern | Pros | Cons | Verdict |
+|---------|------|------|---------|
+| **Distributed 2PC** | Strong consistency | Slow, single point of failure | ❌ Too rigid |
+| **Orchestration (workflow engine)** | Centralized control | Single point of failure, complex | ⚠️ Overkill |
+| **Choreography (events)** | Decoupled, scalable | Harder to debug | ✅ **Chosen** |
+
+---
+
+### Q6: How do you handle seat lock expiry at scale (millions of locks)?
+
+**Answer:**  
+**Scheduled Job with Batch Processing** (runs every 60 seconds):
+```java
+@Scheduled(fixedDelay = 60000)
+@Transactional
+public void expireBookings() {
+    LocalDateTime now = LocalDateTime.now();
+    
+    // Find expired bookings (PENDING + expiry_time < now)
+    // Index on (booking_status, expiry_time) makes this fast
+    List expired = bookingRepository.findExpiredBookings(
+        BookingStatus.PENDING, 
+        now,
+        PageRequest.of(0, 1000) // Process 1000 at a time
+    );
+    
+    for (Booking booking : expired) {
+        cancelBooking(booking.getBookingId()); // Releases seats, invalidates cache
+    }
+}
+```
+
+**Why not Redis TTL + Keyspace Notifications?**
+
+| Approach | Pros | Cons | Verdict |
+|----------|------|------|---------|
+| **Redis TTL** | Real-time expiry | Keyspace notifications unreliable (can miss events), requires separate worker to update DB | ❌ Not reliable |
+| **Scheduled Job** | Simple, reliable, no external dependencies | 60s delay (acceptable—seat released within 1 min) | ✅ **Chosen** |
+| **Database Trigger** | Automatic, real-time | Complex, hard to test, database-specific | ❌ Too complex |
+
+**Optimization:** Index on `(booking_status, expiry_time)` ensures query is fast even with millions of bookings.
+
+---
+
+### Q7: What's your database indexing strategy?
+
+**Answer:**  
+**Indexes are designed based on query patterns:**
+
+**1. Covering Index for Seat Availability:**
+```sql
+CREATE INDEX idx_show_status ON show_seats(show_id, status);
+-- Query: SELECT * FROM show_seats WHERE show_id = ? AND status = 'AVAILABLE'
+-- This index covers the WHERE clause (no table scan needed)
+```
+
+**2. Composite Index for User Bookings:**
+```sql
+CREATE INDEX idx_user_booking ON bookings(user_id, booking_time DESC);
+-- Query: SELECT * FROM bookings WHERE user_id = ? ORDER BY booking_time DESC
+-- Index supports both filtering and sorting
+```
+
+**3. Partial Index for Lock Expiry:**
+```sql
+CREATE INDEX idx_expiry ON bookings(expiry_time) 
+WHERE booking_status = 'PENDING';
+-- Only indexes PENDING bookings (smaller index, faster queries)
+```
+
+**4. Unique Constraint (Prevents Bugs):**
+```sql
+CREATE UNIQUE INDEX idx_unique_show_seat ON show_seats(show_id, seat_id);
+-- Prevents accidentally creating duplicate seat entries
+```
+
+**Trade-offs:**
+- **Indexes speed up reads** but slow down writes (UPDATE/INSERT must update indexes)
+- **Rule of thumb:** Index foreign keys and WHERE/ORDER BY columns
+- **Monitor:** Use `EXPLAIN ANALYZE` to verify index usage
+
+---
+
+### Q8: How do you test concurrency scenarios (race conditions)?
+
+**Answer:**  
+**Multi-threaded integration tests** using JUnit + CountDownLatch:
+```java
+@Test
+public void testConcurrentSeatLocking_ShouldPreventDoubleBooking() throws Exception {
+    Long showId = 12345L;
+    Long seatId = 101L;
+    int numThreads = 100;
+    
+    CountDownLatch startLatch = new CountDownLatch(1);
+    CountDownLatch doneLatch = new CountDownLatch(numThreads);
+    AtomicInteger successCount = new AtomicInteger(0);
+    AtomicInteger failureCount = new AtomicInteger(0);
+    
+    // Spawn 100 threads trying to lock same seat
+    for (int i = 0; i < numThreads; i++) {
+        final long userId = i;
+        executor.submit(() -> {
+            try {
+                startLatch.await(); // All threads wait here
+                
+                LockSeatsRequest request = new LockSeatsRequest(
+                    showId, 
+                    List.of(seatId), 
+                    userId
+                );
+                
+                bookingService.lockSeats(request);
+                successCount.incrementAndGet();
+            } catch (SeatUnavailableException e) {
+                failureCount.incrementAndGet();
+            } finally {
+                doneLatch.countDown();
+            }
+        });
+    }
+    
+    startLatch.countDown(); // Release all threads simultaneously
+    doneLatch.await(); // Wait for all to finish
+    
+    // Verify: Only ONE thread succeeded, 99 failed
+    assertEquals(1, successCount.get());
+    assertEquals(99, failureCount.get());
+}
+```
+
+**Load Testing with Gatling:**
+```scala
+scenario("Concurrent Booking")
+  .exec(http("Lock Seats")
+    .post("/api/v1/bookings/lock")
+    .body(StringBody("""{"showId": 12345, "seatIds": [101]}"""))
+    .check(status.in(201, 409))) // 201 = success, 409 = conflict
+  .inject(
+    rampUsers(10000) during (60 seconds) // 10K users over 1 min
+  )
+```
+
+**Why this matters:**  
+Race conditions are the #1 cause of production bugs in booking systems. Testing at scale catches issues before launch.
+
+---
+
+### Q9: How would you extend this system to support dynamic pricing?
+
+**Answer:**  
+**Strategy Pattern + Event-Driven Pricing Engine**
+
+**Architecture:**
+```java
+public interface PricingStrategy {
+    BigDecimal calculatePrice(Show show, Seat seat, LocalDateTime bookingTime);
+}
+
+@Component
+public class DynamicPricingStrategy implements PricingStrategy {
+    @Override
+    public BigDecimal calculatePrice(Show show, Seat seat, LocalDateTime bookingTime) {
+        BigDecimal basePrice = seat.getBasePrice();
+        
+        // Factor 1: Demand (seats remaining)
+        double occupancy = show.getOccupancyRate();
+        double demandMultiplier = occupancy > 0.8 ? 1.5 : 1.0;
+        
+        // Factor 2: Time to show (surge pricing)
+        long hoursToShow = Duration.between(bookingTime, show.getShowTime()).toHours();
+        double urgencyMultiplier = hoursToShow < 24 ? 1.3 : 1.0;
+        
+        // Factor 3: Day of week (weekend premium)
+        double weekendMultiplier = show.getShowTime().getDayOfWeek().getValue() >= 6 ? 1.2 : 1.0;
+        
+        return basePrice
+            .multiply(BigDecimal.valueOf(demandMultiplier))
+            .multiply(BigDecimal.valueOf(urgencyMultiplier))
+            .multiply(BigDecimal.valueOf(weekendMultiplier))
+            .setScale(2, RoundingMode.HALF_UP);
+    }
+}
+```
+
+**Real-time Price Updates:**
+- Kafka streams aggregate booking events every 5 min
+- Calculate new prices based on demand
+- Update `show_seats.price` + invalidate cache
+- Users see updated prices on refresh
+
+**Challenges:**
+- **Fairness:** Users in checkout shouldn't see price change mid-payment
+  - **Solution:** Lock price at seat selection, honor for 10 minutes
+- **Transparency:** Show "Price may change" warning
+- **Regulations:** Some regions ban dynamic pricing (surge pricing laws)
+
+---
+
+### Q10: How do you handle database failover?
+
+**Answer:**  
+**PostgreSQL Streaming Replication + Automatic Failover (Patroni)**
+
+**Setup:**
+- **Primary (Master):** Handles all writes
+- **Standby Replicas (5x):** Asynchronous replication for reads
+- **Patroni:** Distributed consensus (etcd/Consul) monitors health
+
+**Failover Trigger:**
+- Primary becomes unresponsive (heartbeat timeout)
+- Patroni promotes healthiest standby to new primary
+- Application reconnects via virtual IP (no code changes)
+
+**Downtime:** 30-60 seconds (acceptable for 99.99% SLA)
+
+**Connection Pooling (HikariCP):**
+```java
+hikari.connectionTimeout=30000  // 30s timeout
+hikari.maxLifetime=1800000      // 30 min max connection age
+hikari.validationTimeout=5000   // Test connection before use
+```
+
+**Circuit Breaker Integration:**
+- If DB unreachable → Open circuit → Fail fast
+- Return cached data where possible (degraded mode)
+- User sees: "Service temporarily unavailable. Please retry."
+
+**Why not Multi-Master (Active-Active)?**  
+Conflict resolution is complex for booking system (requires CRDTs or last-write-wins, unacceptable for seat booking).
+
+---
+
+### Q11: What metrics would you monitor in production?
+
+**Answer:**  
+**Four Golden Signals (Google SRE):**
+
+**1. Latency:**
+```promql
+# P99 latency for booking API
+histogram_quantile(0.99, 
+  rate(http_server_requests_seconds_bucket{uri="/api/v1/bookings/lock"}[5m])
+)
+```
+**Alert:** P99 > 500ms for 5 minutes
+
+**2. Traffic:**
+```promql
+# Requests per second
+rate(http_server_requests_total[1m])
+```
+**Alert:** Sudden drop (>50% decrease) indicates outage
+
+**3. Errors:**
+```promql
+# Error rate
+rate(http_server_requests_total{status=~"5.."}[5m]) 
+/ rate(http_server_requests_total[5m])
+```
+**Alert:** Error rate > 1% for 5 minutes
+
+**4. Saturation:**
+```promql
+# Database connection pool utilization
+hikaricp_connections_active / hikaricp_connections_max
+```
+**Alert:** Utilization > 80% for 2 minutes
+
+**Business Metrics:**
+- **Conversion Rate:** `confirmed_bookings / seat_locks` (target: >60%)
+- **Lock Expiry Rate:** `expired_locks / total_locks` (target: <20%)
+- **Payment Success Rate:** `successful_payments / attempted_payments` (target: >95%)
+
+**Custom Dashboards:**
+- Real-time bookings per show (detect hot shows)
+- Average booking amount (revenue tracking)
+- Regional breakdown (Mumbai vs Delhi bookings)
+
+---
+
+### Q12: How would you implement a referral/discount system?
+
+**Answer:**  
+**Coupon Service + Idempotent Application**
+
+**Database Schema:**
+```sql
+CREATE TABLE coupons (
+    coupon_id BIGSERIAL PRIMARY KEY,
+    code VARCHAR(50) UNIQUE NOT NULL,
+    discount_type VARCHAR(20), -- PERCENTAGE, FIXED_AMOUNT
+    discount_value DECIMAL(10,2),
+    max_usage_per_user INT DEFAULT 1,
+    expiry_date TIMESTAMP,
+    min_order_amount DECIMAL(10,2),
+    active BOOLEAN DEFAULT TRUE
+);
+
+CREATE TABLE coupon_usage (
+    usage_id BIGSERIAL PRIMARY KEY,
+    coupon_id BIGINT REFERENCES coupons(coupon_id),
+    user_id BIGINT REFERENCES users(user_id),
+    booking_id BIGINT REFERENCES bookings(booking_id),
+    used_at TIMESTAMP DEFAULT NOW(),
+    UNIQUE(coupon_id, user_id, booking_id) -- Prevent double-application
+);
+```
+
+**Application Logic:**
+```java
+public BigDecimal applyCoupon(String couponCode, Long userId, BigDecimal orderAmount) {
+    Coupon coupon = couponRepository.findByCode(couponCode)
+        .orElseThrow(() -> new CouponNotFoundException("Invalid coupon"));
+    
+    // Validations
+    if (!coupon.isActive()) throw new CouponInactiveException();
+    if (coupon.getExpiryDate().isBefore(LocalDateTime.now())) 
+        throw new CouponExpiredException();
+    if (orderAmount.compareTo(coupon.getMinOrderAmount()) < 0) 
+        throw new MinOrderNotMetException();
+    
+    // Check usage limit
+    int usageCount = couponUsageRepository.countByUserIdAndCouponId(userId, coupon.getCouponId());
+    if (usageCount >= coupon.getMaxUsagePerUser()) 
+        throw new CouponLimitExceededException();
+    
+    // Calculate discount
+    BigDecimal discount = coupon.getDiscountType() == DiscountType.PERCENTAGE
+        ? orderAmount.multiply(coupon.getDiscountValue()).divide(BigDecimal.valueOf(100))
+        : coupon.getDiscountValue();
+    
+    return orderAmount.subtract(discount).max(BigDecimal.ZERO); // Price can't go negative
+}
+
+@Transactional
+public void recordCouponUsage(Long couponId, Long userId, Long bookingId) {
+    // Unique constraint prevents race condition (double-apply)
+    couponUsageRepository.save(new CouponUsage(couponId, userId, bookingId));
+}
+```
+
+**Referral System Extension:**
+```sql
+CREATE TABLE referrals (
+    referral_id BIGSERIAL PRIMARY KEY,
+    referrer_id BIGINT REFERENCES users(user_id),
+    referee_id BIGINT REFERENCES users(user_id),
+    coupon_code VARCHAR(50),
+    status VARCHAR(20), -- PENDING, COMPLETED
+    created_at TIMESTAMP DEFAULT NOW()
+);
+```
+
+**Flow:**
+1. User A shares referral code `REF-A123` with User B
+2. User B signs up with code → Creates referral record
+3. User B makes first booking → Mark referral `COMPLETED`
+4. System generates coupons for both users (e.g., ₹100 off next booking)
+
+**Edge Cases:**
+- **Coupon Stacking:** Allow/disallow multiple coupons? (We disallow by default)
+- **Partial Refunds:** If booking cancelled, restore coupon usage?
+- **Fraud Prevention:** Rate limit coupon applications (max 5 attempts/min)
+
+---
+
+### Q13: Explain your API versioning strategy
+
+**Answer:**  
+**URI Versioning (e.g., `/api/v1/`, `/api/v2/`)** - Most straightforward for REST APIs
+
+**Why URI Versioning?**
+- **Clear:** Version visible in URL
+- **Cacheable:** CDN can cache different versions independently
+- **Backward Compatible:** v1 and v2 coexist (no breaking changes for old clients)
+
+**Example Migration:**
+```java
+// v1: Returns flat structure
+@GetMapping("/api/v1/bookings/{id}")
+public BookingResponseV1 getBookingV1(@PathVariable Long id) {
+    return BookingResponseV1.builder()
+        .bookingId(id)
+        .seatNumbers("A1, A2, A3") // Comma-separated string
+        .build();
+}
+
+// v2: Returns nested structure
+@GetMapping("/api/v2/bookings/{id}")
+public BookingResponseV2 getBookingV2(@PathVariable Long id) {
+    return BookingResponseV2.builder()
+        .bookingId(id)
+        .seats(List.of( // Structured array
+            new SeatInfo("A1", 150.00),
+            new SeatInfo("A2", 150.00)
+        ))
+        .build();
+}
+```
+
+**Deprecation Policy:**
+- v1 supported for 12 months after v2 launch
+- Add `Deprecation: true` header to v1 responses
+- Send in-app notifications to clients still using v1
+- After 12 months → Return `410 Gone` for v1 endpoints
+
+**Alternatives Considered:**
+
+| Strategy | Pros | Cons | Verdict |
+|----------|------|------|---------|
+| **Header Versioning** (`Accept: application/vnd.bms.v1+json`) | Clean URLs | Harder to test, CDN caching issues | ❌ Complex |
+| **Query Param** (`/api/bookings?version=1`) | Flexible | Not RESTful, easy to forget param | ❌ Non-standard |
+| **URI Versioning** (`/api/v1/bookings`) | Simple, explicit | URL changes | ✅ **Chosen** |
+
+---
+
+### Q14: How do you secure the API?
+
+**Answer:**  
+**Defense in Depth (Multiple Layers):**
+
+**1. Authentication (JWT):**
+```java
+// Login endpoint returns JWT
+POST /api/v1/auth/login
+{
+  "email": "user@example.com",
+  "password": "********"
+}
+
+Response:
+{
+  "accessToken": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...",
+  "refreshToken": "...",
+  "expiresIn": 3600 // 1 hour
+}
+
+// Subsequent requests include token
+GET /api/v1/bookings
+Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...
+```
+
+**JWT Validation (Spring Security):**
+```java
+@Bean
+public SecurityFilterChain filterChain(HttpSecurity http) {
+    http
+        .csrf().disable() // Not needed for stateless JWT
+        .authorizeHttpRequests(auth -> auth
+            .requestMatchers("/api/v1/auth/**").permitAll()
+            .requestMatchers("/api/v1/admin/**").hasRole("ADMIN")
+            .anyRequest().authenticated()
+        )
+        .oauth2ResourceServer(oauth2 -> oauth2.jwt());
+    return http.build();
+}
+```
+
+**2. Authorization (RBAC - Role-Based Access Control):**
+```java
+@PreAuthorize("hasRole('USER')")
+public BookingResponse lockSeats(LockSeatsRequest request) {
+    // Only authenticated users can book
+}
+
+@PreAuthorize("hasRole('ADMIN')")
+public void deleteShow(Long showId) {
+    // Only admins can delete shows
+}
+
+@PreAuthorize("#userId == authentication.principal.userId")
+public List getUserBookings(Long userId) {
+    // Users can only view their own bookings
+}
+```
+
+**3. Rate Limiting (Prevent Abuse):**
+```java
+@RateLimiter(name = "bookingApi", fallbackMethod = "rateLimitExceeded")
+public BookingResponse lockSeats(LockSeatsRequest request) {
+    // Limit: 10 requests per minute per user
+}
+```
+
+**4. Input Validation (Prevent Injection):**
+```java
+@Valid
+public BookingResponse lockSeats(@RequestBody @Valid LockSeatsRequest request) {
+    // @Valid triggers validation
+}
+
+public class LockSeatsRequest {
+    @NotNull(message = "Show ID required")
+    private Long showId;
+    
+    @NotEmpty(message = "At least one seat required")
+    @Size(max = 10, message = "Max 10 seats per booking")
+    private List seatIds;
+}
+```
+
+**5. HTTPS Only (TLS 1.3):**
+- All traffic encrypted in transit
+- HTTP Strict Transport Security (HSTS) header
+
+**6. SQL Injection Prevention:**
+- Use parameterized queries (JPA)
+- Never concatenate user input into SQL
+
+**7. Secrets Management:**
+- Store API keys/passwords in AWS Secrets Manager (not in code)
+- Rotate credentials every 90 days
+
+---
+
+### Q15: How would you handle international expansion (multiple countries)?
+
+**Answer:**  
+**Multi-Region Architecture with Geo-Sharding**
+
+**Challenges:**
+1. **Latency:** Users in India shouldn't hit US servers
+2. **Data Residency:** GDPR (Europe), data localization laws (India, China)
+3. **Currency/Payments:** Handle INR, USD, EUR
+4. **Time Zones:** Show timings in local time
+
+**Solution:**
+
+**1. Geo-Distributed Deployment:**
+```
+Region 1: India (ap-south-1)
+  - API servers, PostgreSQL, Redis
+  - Handles: India, Southeast Asia
+  
+Region 2: US (us-east-1)
+  - API servers, PostgreSQL, Redis
+  - Handles: North America, South America
+  
+Region 3: Europe (eu-west-1)
+  - API servers, PostgreSQL, Redis
+  - Handles: Europe, Middle East, Africa
+```
+
+**2. Geo-Routing (AWS Route 53):**
+- DNS routes users to nearest region (lowest latency)
+- Failover: If primary region down → Route to secondary
+
+**3. Data Partitioning:**
+```sql
+-- Each region has its own database
+-- No cross-region data replication (data sovereignty)
+
+-- Global Tables (replicated):
+users, movies, theaters (metadata)
+
+-- Regional Tables (isolated):
+shows, bookings, show_seats (transactional data)
+```
+
+**4. Multi-Currency Support:**
+```java
+public class PriceCalculator {
+    public Money calculatePrice(BigDecimal basePrice, Currency currency) {
+        // Base prices stored in USD, convert at runtime
+        BigDecimal exchangeRate = exchangeRateService.getRate("USD", currency);
+        BigDecimal localPrice = basePrice.multiply(exchangeRate);
+        return new Money(localPrice, currency);
+    }
+}
+```
+
+**5. Localization (i18n):**
+- API responses include `Accept-Language` header
+- Support for 10+ languages (English, Hindi, Spanish, French, etc.)
+- Date/time formatting: ISO 8601 + timezone offset
+
+**Challenges:**
+- **No Global Transactions:** User in India can't book show in US (separate inventories)
+- **Eventual Consistency:** Movie metadata updates take 5-10 sec to replicate globally
+- **Complexity:** 3x infrastructure cost, harder to debug
 
 ---
